@@ -502,35 +502,48 @@ pub fn parse_if_interested(
             let event_type = map.get("event_type").and_then(Value::as_str);
 
             match event_type {
-                None => Ok(vec![]),
                 Some(event_type) if !interest.is_interested_in_event(event_type) => Ok(vec![]),
                 Some(_) => {
                     // Interested: deserialize from cached Value (no re-parsing)
                     let msg: WsMessage = serde_json::from_value(value)?;
                     Ok(vec![msg])
                 }
+                // Initial dump: no event_type, treat as Book if interested
+                None if interest.contains(MessageInterest::BOOK) => {
+                    match serde_json::from_value::<BookUpdate>(value) {
+                        Ok(book) => Ok(vec![WsMessage::Book(book)]),
+                        Err(_) => Ok(vec![]),
+                    }
+                }
+                None => Ok(vec![]),
             }
         }
         Value::Array(arr) => Ok(arr
             .iter()
             .filter_map(|elem| {
                 let obj = elem.as_object()?;
-                let event_type = obj.get("event_type").and_then(Value::as_str)?;
+                let event_type = obj.get("event_type").and_then(Value::as_str);
 
-                if !interest.is_interested_in_event(event_type) {
-                    return None;
+                match event_type {
+                    Some(et) if !interest.is_interested_in_event(et) => None,
+                    Some(_) => serde_json::from_value(elem.clone())
+                        .inspect_err(|_err| {
+                            #[cfg(feature = "tracing")]
+                            warn!(
+                                event_type = %event_type.unwrap_or("unknown"),
+                                error = %_err,
+                                "Skipping unknown/invalid WS event in batch"
+                            );
+                        })
+                        .ok(),
+                    // Initial dump: no event_type, treat as Book if interested
+                    None if interest.contains(MessageInterest::BOOK) => {
+                        serde_json::from_value::<BookUpdate>(elem.clone())
+                            .map(WsMessage::Book)
+                            .ok()
+                    }
+                    None => None,
                 }
-
-                serde_json::from_value(elem.clone())
-                    .inspect_err(|err| {
-                        #[cfg(feature = "tracing")]
-                        warn!(
-                            event_type = %event_type,
-                            error = %err,
-                            "Skipping unknown/invalid WS event in batch"
-                        );
-                    })
-                    .ok()
             })
             .collect()),
         _ => Ok(vec![]),
@@ -1039,10 +1052,102 @@ mod tests {
 
     #[test]
     fn parse_if_interested_returns_empty_for_missing_event_type() {
-        // Object without event_type field
+        // Object without event_type field that doesn't match BookUpdate
         let json = r#"{"some_field": "value"}"#;
         let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::ALL).unwrap();
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn parse_initial_dump_single_object_without_event_type() {
+        // Server sends initial orderbook snapshot without event_type
+        let json = r#"{
+            "asset_id": "106585164761922456203746651621390029417453862034640469075081961934906147433548",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": "1770808703392",
+            "hash": "26ac",
+            "bids": [{"price": "0.001", "size": "35.24"}],
+            "asks": [{"price": "0.999", "size": "10.0"}]
+        }"#;
+
+        // When interested in BOOK, should parse as BookUpdate
+        let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::BOOK).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            WsMessage::Book(book) => {
+                assert_eq!(book.bids.len(), 1);
+                assert_eq!(book.bids[0].price, dec!(0.001));
+                assert_eq!(book.asks.len(), 1);
+                assert_eq!(book.hash, Some("26ac".to_owned()));
+            }
+            _ => panic!("Expected Book message"),
+        }
+
+        // When NOT interested in BOOK, should skip
+        let msgs =
+            parse_if_interested(json.as_bytes(), &MessageInterest::PRICE_CHANGE).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn parse_initial_dump_array_without_event_type() {
+        // Server sends initial orderbook snapshot as array without event_type
+        let json = r#"[
+            {
+                "asset_id": "106585164761922456203746651621390029417453862034640469075081961934906147433548",
+                "market": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "timestamp": "1770808703392",
+                "hash": "abc123",
+                "bids": [{"price": "0.5", "size": "100"}],
+                "asks": [{"price": "0.51", "size": "50"}]
+            },
+            {
+                "asset_id": "85354956062430465315924116860125388538595433819574542752031640332592237464430",
+                "market": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "timestamp": "1770808703392",
+                "bids": [],
+                "asks": [{"price": "0.99", "size": "25"}]
+            }
+        ]"#;
+
+        // When interested in BOOK, should parse both as BookUpdate
+        let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::BOOK).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], WsMessage::Book(b) if b.bids.len() == 1));
+        assert!(matches!(&msgs[1], WsMessage::Book(b) if b.bids.is_empty()));
+
+        // When NOT interested in BOOK, should skip all
+        let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::TRADE).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn parse_initial_dump_mixed_with_tagged_events() {
+        // Array with both initial dump (no event_type) and tagged events
+        let json = r#"[
+            {
+                "asset_id": "106585164761922456203746651621390029417453862034640469075081961934906147433548",
+                "market": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "timestamp": "1770808703392",
+                "bids": [{"price": "0.5", "size": "100"}],
+                "asks": []
+            },
+            {
+                "event_type": "price_change",
+                "market": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "timestamp": "1770808800000",
+                "price_changes": [{
+                    "asset_id": "106585164761922456203746651621390029417453862034640469075081961934906147433548",
+                    "price": "0.52",
+                    "side": "BUY"
+                }]
+            }
+        ]"#;
+
+        let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::ALL).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], WsMessage::Book(_)));
+        assert!(matches!(&msgs[1], WsMessage::PriceChange(_)));
     }
 
     #[test]
