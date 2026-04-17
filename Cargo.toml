@@ -91,6 +91,7 @@ aws-sdk-kms = "1.99.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures-util = "0.3.31"
 httpmock = "0.8.3"
+rustls = { version = "0.23.36", features = ["aws-lc-rs"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -163,6 +164,11 @@ required-features = ["gamma", "tracing"]
 name = "bridge"
 path = "examples/bridge.rs"
 required-features = ["bridge", "tracing"]
+
+[[example]]
+name = "websocket_initial_dump"
+path = "examples/clob/ws/initial_dump.rs"
+required-features = ["clob", "ws"]
 
 [[example]]
 name = "websocket_orderbook"
